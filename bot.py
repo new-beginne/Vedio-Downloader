@@ -1,204 +1,234 @@
 import os
+import time
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import yt_dlp
 import threading
+from queue import Queue
 
-# আপনার BotFather থেকে পাওয়া টোকেন দিন
-BOT_TOKEN = "8694002020:AAH9Ig480bI8UURWo9kkoVt3R1-rlvdQudM"
+# 🔐 Token from environment (SAFE)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 bot = telebot.TeleBot(BOT_TOKEN)
 
-# ইউজারদের লিংক সাময়িকভাবে সেভ রাখার জন্য ডিকশনারি
+# ==============================
+# USER DATA & RATE LIMIT
+# ==============================
 user_data = {}
+user_last = {}
 
 # ==============================
-# Start & Message Handler
+# QUEUE SYSTEM
+# ==============================
+task_queue = Queue()
+
+def worker():
+    while True:
+        data = task_queue.get()
+        if data is None:
+            break
+        download_and_send(*data)
+        task_queue.task_done()
+
+# Start 2 worker threads
+for _ in range(2):
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+
+# ==============================
+# PROGRESS HOOK
+# ==============================
+def progress_hook(d, chat_id, msg_id):
+    if d['status'] == 'downloading':
+        percent = d.get('_percent_str', '').strip()
+        speed = d.get('_speed_str', '')
+        eta = d.get('_eta_str', '')
+
+        text = f"📥 Downloading...\n{percent}\n⚡ {speed} | ⏳ {eta}"
+
+        try:
+            bot.edit_message_text(text, chat_id, msg_id)
+        except:
+            pass
+
+# ==============================
+# BASE YT-DLP OPTIONS
+# ==============================
+def base_opts(chat_id=None, msg_id=None):
+    opts = {
+        'quiet': True,
+        'noplaylist': True,
+        'http_headers': {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+            'Accept-Language': 'en-US,en;q=0.9',
+        },
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['android', 'web']
+            }
+        },
+        'sleep_interval': 2,
+        'max_sleep_interval': 5,
+        'retries': 10,
+        'fragment_retries': 10,
+    }
+    if chat_id and msg_id:
+        opts['progress_hooks'] = [lambda d: progress_hook(d, chat_id, msg_id)]
+    return opts
+
+# ==============================
+# START COMMAND
 # ==============================
 @bot.message_handler(commands=['start'])
 def send_welcome(message):
-    # স্বাগতম মেসেজ (ইংরেজিতে)
-    bot.reply_to(message, "👋 Welcome! I am Ultimate Downloader Bot.\n\n🔗 Please send me any video or playlist link to start.")
-
-@bot.message_handler(func=lambda message: message.text.startswith('http'))
-def handle_link(message):
-    chat_id = message.chat.id
-    url = message.text
-    
-    # লিংক মেমোরিতে সেভ করা
-    user_data[chat_id] = {'url': url}
-    
-    # মেইন মেনু কীবোর্ড (সব বাটন ইংরেজিতে)
-    markup = InlineKeyboardMarkup(row_width=1)
-    markup.add(
-        InlineKeyboardButton("⚡ Auto Best Quality (No Sub)", callback_data="opt1"),
-        InlineKeyboardButton("🇧🇩 Auto Best + Bangla Subtitle", callback_data="opt2"),
-        InlineKeyboardButton("🎬 Choose Quality Manually", callback_data="opt3"),
-        InlineKeyboardButton("🎵 Audio Only (MP3)", callback_data="opt4"),
-        InlineKeyboardButton("📂 Playlist Download", callback_data="opt5"),
-        InlineKeyboardButton("🔗 Direct Link (For 10GB+ / Large Files)", callback_data="opt6")
+    bot.reply_to(message,
+        "👋 Welcome!\n\n"
+        "Send any video/playlist link.\n"
+        "⚠️ Some videos may fail due to YouTube restrictions."
     )
-    
-    bot.reply_to(message, "📌 How do you want to download?", reply_markup=markup)
 
 # ==============================
-# Callback Queries (Menu Logic)
+# LINK HANDLER + RATE LIMIT
+# ==============================
+@bot.message_handler(func=lambda message: message.text.startswith('http'))
+def handle_link(message):
+    user_id = message.from_user.id
+    now = time.time()
+
+    if user_id in user_last and now - user_last[user_id] < 20:
+        bot.reply_to(message, "⏳ Please wait 20 seconds before next request.")
+        return
+
+    user_last[user_id] = now
+
+    chat_id = message.chat.id
+    url = message.text
+    user_data[chat_id] = {'url': url}
+
+    markup = InlineKeyboardMarkup(row_width=1)
+    markup.add(
+        InlineKeyboardButton("⚡ Best Quality", callback_data="opt1"),
+        InlineKeyboardButton("🇧🇩 Video + Bangla Sub", callback_data="opt2"),
+        InlineKeyboardButton("🎬 Choose Quality", callback_data="opt3"),
+        InlineKeyboardButton("🎵 MP3 Audio", callback_data="opt4"),
+        InlineKeyboardButton("📂 Playlist", callback_data="opt5"),
+        InlineKeyboardButton("🔗 Direct Link", callback_data="opt6")
+    )
+
+    bot.reply_to(message, "Choose download option:", reply_markup=markup)
+
+# ==============================
+# CALLBACK HANDLER
 # ==============================
 @bot.callback_query_handler(func=lambda call: True)
 def process_callback(call):
     chat_id = call.message.chat.id
     action = call.data
-    
-    # লিংক খুঁজে না পেলে এরর মেসেজ
-    if chat_id not in user_data or 'url' not in user_data[chat_id]:
-        bot.answer_callback_query(call.id, "❌ Session expired! Please send the link again.", show_alert=True)
+
+    if chat_id not in user_data:
+        bot.answer_callback_query(call.id, "❌ Send link again", show_alert=True)
         return
 
     url = user_data[chat_id]['url']
 
-    # ম্যানুয়াল কোয়ালিটি মেনু
     if action == "opt3":
         markup = InlineKeyboardMarkup(row_width=2)
         markup.add(
-            InlineKeyboardButton("1080p", callback_data="res_1080"),
             InlineKeyboardButton("720p", callback_data="res_720"),
             InlineKeyboardButton("480p", callback_data="res_480"),
-            InlineKeyboardButton("360p", callback_data="res_360")
+            InlineKeyboardButton("360p", callback_data="res_360"),
         )
-        bot.edit_message_text("🎬 Select video resolution:", chat_id=chat_id, message_id=call.message.message_id, reply_markup=markup)
+        bot.edit_message_text("Select quality:", chat_id, call.message.message_id, reply_markup=markup)
         return
 
-    # প্রসেসিং মেসেজ
-    bot.edit_message_text("⏳ Processing your request... Please wait.", chat_id=chat_id, message_id=call.message.message_id)
-    threading.Thread(target=download_and_send, args=(chat_id, action, url, call.message.message_id)).start()
+    queue_size = task_queue.qsize()
+    bot.edit_message_text(f"⏳ Added to queue. Position: {queue_size + 1}", chat_id, call.message.message_id)
+    task_queue.put((chat_id, action, url, call.message.message_id))
 
 # ==============================
-# Core Downloading & Link Fetching Logic
+# DOWNLOAD FUNCTION WITH RETRY
 # ==============================
-def download_and_send(chat_id, action, url, message_id):
+def download_with_retry(ydl_opts, url):
+    for attempt in range(3):
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                return ydl.extract_info(url, download=True)
+        except Exception:
+            time.sleep(2)
+    return None
+
+def download_and_send(chat_id, action, url, msg_id):
     try:
-        # ৬. ডাইরেক্ট ডাউনলোড লিংক লজিক
+        # DIRECT LINK
         if action == "opt6":
-            bot.edit_message_text("🔗 Generating direct link... Please wait.", chat_id=chat_id, message_id=message_id)
-            ydl_opts_direct = {'format': 'best', 'quiet': True}
-            
-            with yt_dlp.YoutubeDL(ydl_opts_direct) as ydl:
-                info = ydl.extract_info(url, download=False)
-                direct_url = info.get('url')
-                title = info.get('title', 'Unknown Video')
-                
-                if direct_url:
-                    msg = (f"🎬 <b>{title}</b>\n\n"
-                           f"🔗 <b>Direct Download Link:</b>\n"
-                           f"<a href='{direct_url}'>📥 Click here to Download</a>\n\n"
-                           f"<i>⚠️ Note: Copy this link to ADM (Mobile), IDM (PC), or any browser to download at full speed!</i>")
-                    bot.send_message(chat_id, msg, parse_mode='HTML')
-                else:
-                    bot.send_message(chat_id, "❌ Could not fetch direct link for this video.")
-            bot.delete_message(chat_id, message_id)
+            ydl_opts = base_opts(chat_id, msg_id)
+            ydl_opts['format'] = 'best'
+            info = download_with_retry(ydl_opts, url)
+            if info:
+                direct = info.get("url")
+                bot.send_message(chat_id, f"🔗 Direct Link:\n{direct}")
+            else:
+                bot.send_message(chat_id, "❌ Failed to fetch direct link!")
             return
 
-        # ডাউনলোডের সেটিংস
-        ydl_opts = {
-            'outtmpl': f'temp_{chat_id}_%(title)s.%(ext)s',
-            'noplaylist': True,
-            'quiet': True,
-            'max_filesize': 50 * 1024 * 1024, # টেলিগ্রামের ৫০ এমবি লিমিট
-        }
-        
+        ydl_opts = base_opts(chat_id, msg_id)
+        ydl_opts['outtmpl'] = f'temp_{chat_id}_%(title)s.%(ext)s'
+
+        # FORMAT LOGIC
         if action == "opt1":
-            ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-        
+            ydl_opts['format'] = 'best[height<=720]'
         elif action == "opt2":
-            ydl_opts['format'] = 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+            ydl_opts['format'] = 'best[height<=720]'
             ydl_opts['writesubtitles'] = True
             ydl_opts['writeautomaticsub'] = True
-            ydl_opts['subtitleslangs'] =['bn', 'bn.*', 'bn-BD']
-            ydl_opts['postprocessors'] =[
-                {'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'},
-                {'key': 'FFmpegEmbedSubtitle'}
-            ]
-        
+            ydl_opts['subtitleslangs'] = ['bn']
         elif action.startswith("res_"):
             res = action.split("_")[1]
-            ydl_opts['format'] = f'bestvideo[height<={res}][ext=mp4]+bestaudio[ext=m4a]/best[height<={res}][ext=mp4]/best'
-        
+            ydl_opts['format'] = f'best[height<={res}]'
         elif action == "opt4":
             ydl_opts['format'] = 'bestaudio/best'
-            ydl_opts['postprocessors'] =[
-                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3', 'preferredquality': '192'},
-                {'key': 'EmbedThumbnail'}
+            ydl_opts['postprocessors'] = [
+                {'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}
             ]
-            ydl_opts['writethumbnail'] = True
-            ydl_opts['outtmpl'] = f'temp_{chat_id}_%(title)s.mp3'
-        
         elif action == "opt5":
-            bot.edit_message_text("📂 Scanning playlist... This may take a while.", chat_id=chat_id, message_id=message_id)
             ydl_opts['noplaylist'] = False
             ydl_opts['format'] = 'best[ext=mp4]/best'
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-                bot.send_message(chat_id, f"✅ Playlist download finished! Uploading files...")
-                for entry in info['entries']:
-                    if not entry: continue
-                    filename = ydl.prepare_filename(entry)
-                    send_file_to_telegram(chat_id, filename, is_audio=False)
-            bot.delete_message(chat_id, message_id)
+
+        bot.edit_message_text("⏳ Downloading...", chat_id, msg_id)
+        info = download_with_retry(ydl_opts, url)
+
+        if not info:
+            bot.send_message(chat_id, "❌ Failed after retries!")
             return
 
-        # ডাউনলোড শুরু করার মেসেজ
-        bot.edit_message_text("📥 Downloading file to server...", chat_id=chat_id, message_id=message_id)
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            filename = ydl.prepare_filename(info)
-            if action == "opt4":
-                filename = filename.rsplit('.', 1)[0] + '.mp3'
-            elif action == "opt2":
-                filename = filename.rsplit('.', 1)[0] + '.mp4'
+        filename = yt_dlp.YoutubeDL(ydl_opts).prepare_filename(info)
 
-        # আপলোড শুরু করার মেসেজ
-        bot.edit_message_text("📤 Uploading file to Telegram...", chat_id=chat_id, message_id=message_id)
-        
-        is_audio = (action == "opt4")
-        success = send_file_to_telegram(chat_id, filename, is_audio)
-        
-        if success:
-            bot.delete_message(chat_id, message_id)
-        else:
-            bot.edit_message_text("❌ File is larger than 50MB. Please use 'Direct Link' option.", chat_id=chat_id, message_id=message_id)
+        if action == "opt4":
+            filename = filename.rsplit('.', 1)[0] + '.mp3'
+
+        if os.path.getsize(filename) > 50 * 1024 * 1024:
+            bot.send_message(chat_id, "❌ File too large! Use Direct Link.")
+            os.remove(filename)
+            return
+
+        # SEND FILE
+        with open(filename, 'rb') as f:
+            if action == "opt4":
+                bot.send_audio(chat_id, f)
+            else:
+                bot.send_video(chat_id, f)
+
+        os.remove(filename)
 
     except yt_dlp.utils.DownloadError as e:
-        if 'File is larger than max-filesize' in str(e):
-            bot.edit_message_text("❌ File size is over 50MB! Please use option 6 'Direct Link'.", chat_id=chat_id, message_id=message_id)
+        err = str(e)
+        if "Sign in to confirm" in err:
+            bot.send_message(chat_id, "⚠️ YouTube blocked! Use Direct Link or try later.")
         else:
-            bot.send_message(chat_id, f"❌ An error occurred:\n{str(e)[:100]}...")
+            bot.send_message(chat_id, f"❌ Error:\n{err[:100]}")
+
     except Exception as e:
-        bot.send_message(chat_id, f"❌ Something went wrong:\n{str(e)[:100]}...")
+        bot.send_message(chat_id, f"❌ Crash:\n{str(e)[:100]}")
 
 # ==============================
-# Telegram File Sender
-# ==============================
-def send_file_to_telegram(chat_id, filename, is_audio=False):
-    try:
-        # ফাইল সাইজ ৫০ এমবি এর বেশি কি না চেক
-        if os.path.getsize(filename) > 50 * 1024 * 1024:
-            os.remove(filename)
-            return False
-            
-        with open(filename, 'rb') as file:
-            if is_audio:
-                bot.send_audio(chat_id, file, caption="🎵 Downloaded by Ultimate Downloader")
-            else:
-                bot.send_video(chat_id, file, caption="🎬 Downloaded by Ultimate Downloader")
-        
-        # আপলোড শেষে ফাইল ডিলেট করা
-        os.remove(filename)
-        return True
-    except:
-        if os.path.exists(filename): os.remove(filename)
-        return False
-
-# বট চালু হওয়ার কনসোল মেসেজ
 print("🤖 Ultimate Downloader Bot is running...")
 bot.infinity_polling()
